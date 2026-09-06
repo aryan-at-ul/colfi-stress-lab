@@ -598,6 +598,136 @@ def test_store_persists_configuration_events_and_approval(tmp_path: Path):
     assert store.approvals("AST-TEST")[0]["approved"] is True
 
 
+def test_store_returns_stable_ten_item_assessment_pages(tmp_path: Path):
+    store = LiveStore(tmp_path / "history.sqlite3")
+    for index in range(12):
+        assessment_id = f"AST-{index:02d}"
+        store.create(assessment_id, request().model_dump(mode="json"))
+        with store._connect() as db:
+            db.execute(
+                "UPDATE live_assessments SET created_at=? WHERE id=?",
+                (1_000 + index, assessment_id),
+            )
+
+    first = store.assessment_page(page=1, page_size=10)
+    assert first["total"] == 12
+    assert first["total_pages"] == 2
+    assert [row["id"] for row in first["rows"]] == [
+        f"AST-{index:02d}" for index in range(11, 1, -1)
+    ]
+
+    last = store.assessment_page(page=99, page_size=10)
+    assert last["page"] == 2
+    assert [row["id"] for row in last["rows"]] == ["AST-01", "AST-00"]
+    assert all("evidence" not in row and "report" not in row for row in last["rows"])
+
+
+def test_store_filters_history_before_pagination(tmp_path: Path):
+    store = LiveStore(tmp_path / "filtered-history.sqlite3")
+    records = (
+        ("AST-A", "custom", "awaiting_event_approval"),
+        ("AST-B", "custom", "awaiting_release_approval"),
+        ("AST-C", "custom", "complete"),
+        ("AST-D", "svb_2023_run", "awaiting_suite_approval"),
+        ("AST-E", "svb_2023_run", "failed"),
+    )
+    for index, (assessment_id, event_id, status) in enumerate(records):
+        store.create(
+            assessment_id,
+            request(event_id=event_id).model_dump(mode="json"),
+        )
+        store.update(assessment_id, status=status)
+        with store._connect() as db:
+            db.execute(
+                "UPDATE live_assessments SET created_at=? WHERE id=?",
+                (2_000 + index, assessment_id),
+            )
+
+    awaiting = store.assessment_page(
+        page=1, page_size=10, status="awaiting_approval"
+    )
+    assert awaiting["total"] == 3
+    assert [row["id"] for row in awaiting["rows"]] == [
+        "AST-D", "AST-B", "AST-A",
+    ]
+
+    custom_awaiting = store.assessment_page(
+        page=1,
+        page_size=10,
+        event_id="custom",
+        status="awaiting_approval",
+    )
+    assert custom_awaiting["total"] == 2
+    assert [row["id"] for row in custom_awaiting["rows"]] == [
+        "AST-B", "AST-A",
+    ]
+
+
+def test_assessment_history_api_returns_pagination_metadata(
+    tmp_path: Path,
+    monkeypatch,
+):
+    from adcs import api as api_module
+
+    store = LiveStore(tmp_path / "history-api.sqlite3")
+    for index in range(12):
+        assessment_id = f"AST-API-{index:02d}"
+        event_id = "custom" if index < 4 else "svb_2023_run"
+        store.create(
+            assessment_id,
+            request(event_id=event_id).model_dump(mode="json"),
+        )
+        store.update(
+            assessment_id,
+            status="complete" if index % 2 == 0 else "failed",
+        )
+        with store._connect() as db:
+            db.execute(
+                "UPDATE live_assessments SET created_at=? WHERE id=?",
+                (3_000 + index, assessment_id),
+            )
+
+    monkeypatch.setattr(api_module, "STORE", store)
+    first = api_module.list_assessments(
+        page=1,
+        page_size=api_module.AssessmentPageSize.ten,
+        event_id=None,
+        status=None,
+    )
+    assert len(first["assessments"]) == 10
+    assert first["pagination"] == {
+        "page": 1,
+        "page_size": 10,
+        "total": 12,
+        "total_pages": 2,
+        "has_previous": False,
+        "has_next": True,
+    }
+
+    filtered = api_module.list_assessments(
+        page=1,
+        page_size=api_module.AssessmentPageSize.ten,
+        event_id="custom",
+        status="complete",
+    )
+    assert filtered["pagination"]["total"] == 2
+    assert all(
+        item["event_id"] == "custom" and item["status"] == "complete"
+        for item in filtered["assessments"]
+    )
+
+
+def test_assessment_page_size_accepts_query_strings_and_rejects_other_values():
+    from pydantic import TypeAdapter
+
+    from adcs.api import AssessmentPageSize
+
+    adapter = TypeAdapter(AssessmentPageSize)
+    assert adapter.validate_python("10") is AssessmentPageSize.ten
+    with pytest.raises(ValidationError):
+        adapter.validate_python("11")
+
+
 def test_restart_marks_running_step_failed_and_retryable(tmp_path: Path):
     store = LiveStore(tmp_path / "live.sqlite3")
     store.create("AST-INTERRUPTED", request().model_dump(mode="json"))
