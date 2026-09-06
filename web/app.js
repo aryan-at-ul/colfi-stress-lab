@@ -955,6 +955,30 @@ function wireAssessmentTabs() {
 
 function renderDemoResult(a) {
   const result = a.demo_result;
+  const peakImpact = result.cards.find(card => card.id === "peak_impact");
+  const peakImpactReduction = peakImpact?.effect?.relative_reduction;
+  const impactStatus = peakImpact?.effect?.status || "undefined";
+  let resultSummary = "The modelled peak market impact comparison is unavailable.";
+  if (result.deterministic_rules && result.stress_flag_count === 0) {
+    resultSummary = "No institution stress flag activated the selling rule, so neither path sold.";
+  } else if (result.deterministic_rules) {
+    const outcome = impactStatus === "improved"
+      ? "lowered"
+      : impactStatus === "worsened" ? "increased" : "did not change";
+    resultSummary = `The safeguard reduced the stress sale from 20% to ${fmt(result.daily_cap_pct, 0)}% and ${outcome} modelled peak market impact.`;
+  } else if (impactStatus !== "undefined") {
+    resultSummary = "The approved execution policy changed modelled peak market impact.";
+  }
+  const relativeLabel = impactStatus === "worsened"
+    ? "Relative increase"
+    : impactStatus === "unchanged" ? "Relative change" : "Relative reduction";
+  const peakImpactDetail = peakImpact
+    ? `<p class="result-headline-values">
+        <span>Unmitigated peak <strong>${resultValue(peakImpact.unmitigated, peakImpact.unit, 4)}</strong></span>
+        <span>Safeguarded peak <strong>${resultValue(peakImpact.safeguarded, peakImpact.unit, 4)}</strong></span>
+        <span>${relativeLabel} <strong>${peakImpactReduction == null ? "—" : `${fmt(Math.abs(Number(peakImpactReduction)) * 100, 3)}%`}</strong></span>
+      </p>`
+    : "";
   const maxSell = Math.max(1, ...result.rounds.flatMap(row => [
     Number(row.unmitigated_sell_pct || 0), Number(row.safeguarded_sell_pct || 0),
   ]));
@@ -997,8 +1021,8 @@ function renderDemoResult(a) {
     : "";
   app.innerHTML = `${assessmentTabs("results")}<section class="result-hero">
       <div class="result-meta">Assessment · ${esc(result.start_date)} → ${esc(result.end_date)} · ${result.institution_count} scenario institutions · ${esc(result.status)}</div>
-      <h2>${esc(result.headline)}</h2>
-      <p>${esc(result.caveat)}</p>
+      <h2>${esc(resultSummary)}</h2>
+      ${peakImpactDetail}
       <div class="result-fixed-market">Historical market return held fixed in both paths:
         <strong>${resultValue(result.historical_exogenous_return_pct, "%", 3)}</strong>. It is not included in the safeguard-improvement denominator.</div>
       <div class="result-cards">${cards}</div>
