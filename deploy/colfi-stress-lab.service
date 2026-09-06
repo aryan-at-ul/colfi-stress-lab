@@ -1,0 +1,29 @@
+[Unit]
+Description=COLFI Agentic Stress Lab development service
+Documentation=file:///home/annatar/projects/colfi-stress-lab/colfi-stress-lab/README.md
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=annatar
+Group=annatar
+WorkingDirectory=/home/annatar/projects/colfi-stress-lab/colfi-stress-lab
+EnvironmentFile=/home/annatar/projects/colfi-stress-lab/colfi-stress-lab/.env
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/home/annatar/miniconda3/bin/python3 -m uvicorn adcs.api:app --host 0.0.0.0 --port 8001
+Restart=always
+RestartSec=5
+TimeoutStartSec=30
+TimeoutStopSec=30
+KillSignal=SIGINT
+
+# Keep runtime writes inside the project while allowing outbound model calls.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/home/annatar/projects/colfi-stress-lab/colfi-stress-lab
+
+[Install]
+WantedBy=multi-user.target
