@@ -62,6 +62,16 @@ class LiveStore:
                 payload_json TEXT NOT NULL,
                 FOREIGN KEY (assessment_id) REFERENCES live_assessments(id)
             );
+            CREATE INDEX IF NOT EXISTS live_assessments_created_idx
+                ON live_assessments(created_at DESC, id DESC);
+            CREATE INDEX IF NOT EXISTS live_assessments_status_created_idx
+                ON live_assessments(status, created_at DESC, id DESC);
+            CREATE INDEX IF NOT EXISTS live_assessments_event_created_idx
+                ON live_assessments(
+                    json_extract(request_json, '$.event_id'),
+                    created_at DESC,
+                    id DESC
+                );
             """)
             migrate_v5_schema(db)
 
@@ -101,6 +111,52 @@ class LiveStore:
             return [self._decode(r) for r in db.execute(
                 "SELECT * FROM live_assessments ORDER BY created_at DESC"
             ).fetchall()]
+
+    def assessment_page(
+        self,
+        *,
+        page: int,
+        page_size: int,
+        event_id: str | None = None,
+        status: str | None = None,
+    ) -> dict:
+        """Return one filtered page without loading full assessment payloads."""
+        clauses = ["json_type(request_json, '$.institutions') IS NOT NULL"]
+        values: list[Any] = []
+        if event_id:
+            clauses.append("json_extract(request_json, '$.event_id') = ?")
+            values.append(event_id)
+        if status == "awaiting_approval":
+            clauses.append("status GLOB ?")
+            values.append("awaiting_*_approval")
+        elif status:
+            clauses.append("status = ?")
+            values.append(status)
+
+        where = " AND ".join(clauses)
+        with self._connect() as db:
+            total = int(db.execute(
+                f"SELECT COUNT(*) FROM live_assessments WHERE {where}",
+                values,
+            ).fetchone()[0])
+            total_pages = (total + page_size - 1) // page_size
+            resolved_page = min(page, total_pages) if total_pages else 1
+            offset = (resolved_page - 1) * page_size
+            rows = db.execute(
+                "SELECT id, created_at, updated_at, status, current_step, "
+                "request_json, classification_json, responses_json, metrics_json "
+                f"FROM live_assessments WHERE {where} "
+                "ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?",
+                [*values, page_size, offset],
+            ).fetchall()
+
+        return {
+            "rows": [self._decode(row) for row in rows],
+            "page": resolved_page,
+            "page_size": page_size,
+            "total": total,
+            "total_pages": total_pages,
+        }
 
     def update(self, assessment_id: str, *, status: str | None = None,
                current_step: str | None = None, error: str | None = None,

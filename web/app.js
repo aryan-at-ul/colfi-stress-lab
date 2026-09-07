@@ -3,6 +3,8 @@ const state = {
   assessment: null,
   poll: null,
   history: null,
+  historyQuery: {page: 1, pageSize: 10, eventId: "", status: ""},
+  historyRequest: 0,
   disclosures: new Map(),
   assessmentView: "results",
 };
@@ -953,6 +955,30 @@ function wireAssessmentTabs() {
 
 function renderDemoResult(a) {
   const result = a.demo_result;
+  const peakImpact = result.cards.find(card => card.id === "peak_impact");
+  const peakImpactReduction = peakImpact?.effect?.relative_reduction;
+  const impactStatus = peakImpact?.effect?.status || "undefined";
+  let resultSummary = "The modelled peak market impact comparison is unavailable.";
+  if (result.deterministic_rules && result.stress_flag_count === 0) {
+    resultSummary = "No institution stress flag activated the selling rule, so neither path sold.";
+  } else if (result.deterministic_rules) {
+    const outcome = impactStatus === "improved"
+      ? "lowered"
+      : impactStatus === "worsened" ? "increased" : "did not change";
+    resultSummary = `The safeguard reduced the stress sale from 20% to ${fmt(result.daily_cap_pct, 0)}% and ${outcome} modelled peak market impact.`;
+  } else if (impactStatus !== "undefined") {
+    resultSummary = "The approved execution policy changed modelled peak market impact.";
+  }
+  const relativeLabel = impactStatus === "worsened"
+    ? "Relative increase"
+    : impactStatus === "unchanged" ? "Relative change" : "Relative reduction";
+  const peakImpactDetail = peakImpact
+    ? `<p class="result-headline-values">
+        <span>Unmitigated peak <strong>${resultValue(peakImpact.unmitigated, peakImpact.unit, 4)}</strong></span>
+        <span>Safeguarded peak <strong>${resultValue(peakImpact.safeguarded, peakImpact.unit, 4)}</strong></span>
+        <span>${relativeLabel} <strong>${peakImpactReduction == null ? "—" : `${fmt(Math.abs(Number(peakImpactReduction)) * 100, 3)}%`}</strong></span>
+      </p>`
+    : "";
   const maxSell = Math.max(1, ...result.rounds.flatMap(row => [
     Number(row.unmitigated_sell_pct || 0), Number(row.safeguarded_sell_pct || 0),
   ]));
@@ -995,8 +1021,8 @@ function renderDemoResult(a) {
     : "";
   app.innerHTML = `${assessmentTabs("results")}<section class="result-hero">
       <div class="result-meta">Assessment · ${esc(result.start_date)} → ${esc(result.end_date)} · ${result.institution_count} scenario institutions · ${esc(result.status)}</div>
-      <h2>${esc(result.headline)}</h2>
-      <p>${esc(result.caveat)}</p>
+      <h2>${esc(resultSummary)}</h2>
+      ${peakImpactDetail}
       <div class="result-fixed-market">Historical market return held fixed in both paths:
         <strong>${resultValue(result.historical_exogenous_return_pct, "%", 3)}</strong>. It is not included in the safeguard-improvement denominator.</div>
       <div class="result-cards">${cards}</div>
@@ -1151,6 +1177,83 @@ async function retryStep(event) {
   }
 }
 
+const HISTORY_PAGE_SIZES = [10, 25, 50];
+const HISTORY_STATUSES = [
+  ["", "All statuses"],
+  ["running", "Running"],
+  ["awaiting_approval", "Awaiting approval"],
+  ["complete", "Complete"],
+  ["failed", "Failed"],
+  ["rejected", "Rejected"],
+];
+
+function historyQueryFromLocation() {
+  const params = new URLSearchParams(window.location.search);
+  const page = Number(params.get("page"));
+  const pageSize = Number(params.get("page_size"));
+  const status = params.get("status") || "";
+  return {
+    page: Number.isInteger(page) && page > 0 ? page : 1,
+    pageSize: HISTORY_PAGE_SIZES.includes(pageSize) ? pageSize : 10,
+    eventId: params.get("event") || "",
+    status: HISTORY_STATUSES.some(([value]) => value === status) ? status : "",
+  };
+}
+
+function historyApiPath() {
+  const query = state.historyQuery;
+  const params = new URLSearchParams({
+    page: String(query.page),
+    page_size: String(query.pageSize),
+  });
+  if (query.eventId) params.set("event_id", query.eventId);
+  if (query.status) params.set("status", query.status);
+  return `/assessments?${params.toString()}`;
+}
+
+function syncHistoryUrl() {
+  const query = state.historyQuery;
+  const params = new URLSearchParams({view: "history"});
+  if (query.page > 1) params.set("page", String(query.page));
+  if (query.pageSize !== 10) params.set("page_size", String(query.pageSize));
+  if (query.eventId) params.set("event", query.eventId);
+  if (query.status) params.set("status", query.status);
+  history.replaceState(null, "", `${window.location.pathname}?${params.toString()}`);
+}
+
+function historyPageItems(current, total) {
+  if (total <= 7) return Array.from({length: total}, (_, index) => index + 1);
+  const visible = [...new Set([
+    1, total, current - 1, current, current + 1,
+  ].filter(page => page >= 1 && page <= total))].sort((left, right) => left - right);
+  const items = [];
+  visible.forEach((page, index) => {
+    if (index && page - visible[index - 1] > 1) items.push("…");
+    items.push(page);
+  });
+  return items;
+}
+
+function historyEventOptions(selected) {
+  const options = [
+    ["", "All events"],
+    ["custom", "Custom event"],
+    ...Object.entries(state.config.known_events).map(([id, item]) => [id, item.label]),
+  ];
+  if (selected && !options.some(([value]) => value === selected)) {
+    options.push([selected, selected]);
+  }
+  return options.map(([value, label]) =>
+    `<option value="${esc(value)}" ${value === selected ? "selected" : ""}>${esc(label)}</option>`
+  ).join("");
+}
+
+function historyStatusOptions(selected) {
+  return HISTORY_STATUSES.map(([value, label]) =>
+    `<option value="${esc(value)}" ${value === selected ? "selected" : ""}>${esc(label)}</option>`
+  ).join("");
+}
+
 function startPolling() {
   if (state.poll) clearInterval(state.poll);
   if (state.assessment?.status !== "running") {
@@ -1176,20 +1279,78 @@ async function renderHistory() {
     clearInterval(state.poll);
     state.poll = null;
   }
-  try { state.history = await api("/assessments"); }
+  const requestId = ++state.historyRequest;
+  if (!state.history) {
+    app.innerHTML = '<div class="loading"><span class="spinner"></span><strong>Loading assessment history…</strong></div>';
+  }
+  let response;
+  try { response = await api(historyApiPath()); }
   catch (error) { app.innerHTML = errorBox(error); return; }
+  if (requestId !== state.historyRequest) return;
+  state.history = response;
+  const pagination = response.pagination;
+  state.historyQuery.page = pagination.page;
+  syncHistoryUrl();
+  const start = pagination.total ? ((pagination.page - 1) * pagination.page_size) + 1 : 0;
+  const end = Math.min(pagination.page * pagination.page_size, pagination.total);
+  const filtered = Boolean(state.historyQuery.eventId || state.historyQuery.status);
   const rows = state.history.assessments.map(item => `<tr>
     <td><strong class="mono">${esc(item.id)}</strong></td>
-    <td>${esc(item.window)}<small>${esc(item.event_id)}</small></td>
+    <td>${esc(item.window)}<small>${esc(item.event_id === "custom" ? "Custom event" : state.config.known_events[item.event_id]?.label || item.event_id)}</small></td>
     <td>${esc(item.event_type || "Pending classification")}</td>
     <td>${item.institution_count || "—"}</td><td>${item.agent_run_count}</td>
     <td><span class="status ${item.result_validity === "withdrawn_legacy_metrics" ? "failed" : esc(item.status)}">${item.result_validity === "withdrawn_legacy_metrics" ? "withdrawn legacy result" : esc(item.status)}</span></td>
     <td><button data-open="${esc(item.id)}">Open</button></td></tr>`).join("");
+  const pageButtons = historyPageItems(
+    pagination.page, pagination.total_pages
+  ).map(item => item === "…"
+    ? '<span class="pagination-ellipsis" aria-hidden="true">…</span>'
+    : `<button type="button" data-history-page="${item}" class="${item === pagination.page ? "active" : ""}" ${item === pagination.page ? 'aria-current="page"' : `aria-label="Page ${item}"`}>${item}</button>`
+  ).join("");
+  const paginationControls = pagination.total_pages > 1 ? `
+    <nav class="history-pagination" aria-label="Assessment history pagination">
+      <button type="button" data-history-page="${pagination.page - 1}" ${pagination.has_previous ? "" : "disabled"} aria-label="Previous page">← Previous</button>
+      <span class="pagination-pages">${pageButtons}</span>
+      <button type="button" data-history-page="${pagination.page + 1}" ${pagination.has_next ? "" : "disabled"} aria-label="Next page">Next →</button>
+    </nav>` : "";
   app.innerHTML = `<section class="panel history"><div class="section-head"><div><span class="eyebrow">RUN REGISTRY</span>
-    <h2>Assessment history</h2></div><span>${state.history.assessments.length} records</span></div>
+    <h2>Assessment history</h2></div><span>${pagination.total} ${filtered ? "matching " : ""}record${pagination.total === 1 ? "" : "s"}</span></div>
+    <div class="history-filters">
+      <label>Event<select id="history-event">${historyEventOptions(state.historyQuery.eventId)}</select></label>
+      <label>Status<select id="history-status">${historyStatusOptions(state.historyQuery.status)}</select></label>
+      <button type="button" id="history-clear" ${filtered ? "" : "disabled"}>Clear filters</button>
+    </div>
     <div class="table-wrap"><table><thead><tr><th>Assessment</th><th>Evidence window</th>
       <th>Event</th><th>Institutions</th><th>Agent runs</th><th>Status</th><th></th></tr></thead>
-      <tbody>${rows || '<tr><td colspan="7">No assessments yet.</td></tr>'}</tbody></table></div></section>`;
+      <tbody>${rows || `<tr><td colspan="7" class="empty">${filtered ? "No assessments match these filters." : "No assessments yet."}</td></tr>`}</tbody></table></div>
+    <div class="history-footer"><span>Showing ${start}–${end} of ${pagination.total} assessments</span>
+      <label>Rows per page<select id="history-page-size">${HISTORY_PAGE_SIZES.map(size => `<option value="${size}" ${size === pagination.page_size ? "selected" : ""}>${size}</option>`).join("")}</select></label></div>
+    ${paginationControls}
+  </section>`;
+  document.querySelector("#history-event").addEventListener("change", event => {
+    state.historyQuery.eventId = event.currentTarget.value;
+    state.historyQuery.page = 1;
+    renderHistory();
+  });
+  document.querySelector("#history-status").addEventListener("change", event => {
+    state.historyQuery.status = event.currentTarget.value;
+    state.historyQuery.page = 1;
+    renderHistory();
+  });
+  document.querySelector("#history-page-size").addEventListener("change", event => {
+    state.historyQuery.pageSize = Number(event.currentTarget.value);
+    state.historyQuery.page = 1;
+    renderHistory();
+  });
+  document.querySelector("#history-clear").addEventListener("click", () => {
+    state.historyQuery = {page: 1, pageSize: state.historyQuery.pageSize, eventId: "", status: ""};
+    renderHistory();
+  });
+  document.querySelectorAll("[data-history-page]").forEach(button => button.addEventListener("click", () => {
+    if (button.disabled) return;
+    state.historyQuery.page = Number(button.dataset.historyPage);
+    renderHistory();
+  }));
   document.querySelectorAll("[data-open]").forEach(button => button.addEventListener("click", async () => {
     state.assessment = await api(`/assessments/${button.dataset.open}`);
     state.assessmentView = "results";
@@ -1206,7 +1367,8 @@ document.querySelector("#new-assessment").addEventListener("click", () => {
   renderConfigure();
 });
 document.querySelector("#show-history").addEventListener("click", () => {
-  history.replaceState(null, "", window.location.pathname);
+  state.history = null;
+  state.historyQuery = {page: 1, pageSize: 10, eventId: "", status: ""};
   renderHistory();
 });
 
@@ -1228,6 +1390,9 @@ document.querySelector("#show-history").addEventListener("click", () => {
       state.assessmentView = "results";
       renderAssessment();
       startPolling();
+    } else if (new URLSearchParams(window.location.search).get("view") === "history") {
+      state.historyQuery = historyQueryFromLocation();
+      await renderHistory();
     } else {
       renderConfigure();
     }

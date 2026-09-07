@@ -6,9 +6,11 @@ import os
 import sqlite3
 import uuid
 from datetime import date
+from enum import IntEnum
 from pathlib import Path
+from typing import Annotated, Literal
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
@@ -72,6 +74,14 @@ app = FastAPI(
         "using runtime market evidence and supervisor-generated assessment suites."
     ),
 )
+
+
+class AssessmentPageSize(IntEnum):
+    ten = 10
+    twenty_five = 25
+    fifty = 50
+
+
 WEB = Path(__file__).resolve().parent.parent / "web"
 DB_PATH = os.environ.get("ADCS_LIVE_DB", "adcs_live.sqlite3")
 STORE = LiveStore(DB_PATH)
@@ -864,13 +874,23 @@ def create_assessment(request: AssessmentRequest):
 
 
 @app.get("/api/assessments")
-def list_assessments():
-    rows = [
-        row for row in STORE.list()
-        if "institutions" in row.get("request", {})
-    ]
+def list_assessments(
+    page: Annotated[int, Query(ge=1)] = 1,
+    page_size: AssessmentPageSize = AssessmentPageSize.ten,
+    event_id: Annotated[str | None, Query(min_length=1, max_length=80)] = None,
+    status: Literal[
+        "running", "awaiting_approval", "complete", "failed", "rejected"
+    ] | None = None,
+):
+    resolved_page_size = int(page_size)
+    result = STORE.assessment_page(
+        page=page,
+        page_size=resolved_page_size,
+        event_id=event_id,
+        status=status,
+    )
     assessments = []
-    for row in rows:
+    for row in result["rows"]:
         request = row["request"]
         assignments = request.get("institutions", [])
         models = (
@@ -896,7 +916,17 @@ def list_assessments():
             "institution_count": len(assignments),
             "agent_run_count": len(row.get("responses") or []),
         })
-    return {"assessments": assessments}
+    return {
+        "assessments": assessments,
+        "pagination": {
+            "page": result["page"],
+            "page_size": result["page_size"],
+            "total": result["total"],
+            "total_pages": result["total_pages"],
+            "has_previous": result["page"] > 1,
+            "has_next": result["page"] < result["total_pages"],
+        },
+    }
 
 
 @app.get("/api/assessments/{assessment_id}")
