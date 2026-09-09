@@ -27,9 +27,18 @@ evidence base and explicit boundaries.
 10. Show raw intent, execution, feedback and impact values with their formulas;
     generate a verified deterministic report and require human release approval.
 
-There is no mock provider, response fixture, response cache or hard-coded agent
-decision. The event catalog and portfolio catalog are versioned evaluation
-inputs. They are never represented as actual institutional data.
+There is no mock provider, response fixture, hidden model-response cache or
+hard-coded agent decision. The event catalog and portfolio catalog are
+versioned evaluation inputs. They are never represented as actual
+institutional data.
+
+For time-limited demonstrations, **Use cached demo replay when available** may
+be selected when launching an assessment. It replays only an exactly matching,
+previously released assessment and clearly labels the replay while stepping
+through its persisted 14-step execution log. A cache miss follows the normal
+live workflow, and leaving the option off always forces a fresh assessment.
+The original result, audit events and human approvals remain attributed to the
+source assessment; replay never fabricates new provider calls or approvals.
 
 ## Data sources
 

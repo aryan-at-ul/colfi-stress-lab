@@ -7,6 +7,7 @@ const state = {
   historyRequest: 0,
   disclosures: new Map(),
   assessmentView: "results",
+  cacheReplayTimer: null,
 };
 const app = document.querySelector("#app");
 const activeId = document.querySelector("#active-id");
@@ -277,6 +278,9 @@ function renderConfigure() {
             <label class="switch-row"><input id="include-safeguard" type="checkbox" name="include_safeguard" checked>
               <span><strong>Include paired safeguarded execution</strong><small>The same stress flag is reused; code replaces the 20% sale with 10% and cancels the blocked 10%.</small></span>
             </label>
+            <label class="switch-row cache-switch"><input id="use-cached" type="checkbox" name="use_cached">
+              <span><strong>Use cached demo replay when available (<code>use_cached</code>)</strong><small>An exactly matching released assessment replays its verified 14-step log in seconds. If none exists, this runs normally and becomes available after release.</small></span>
+            </label>
             <label>Optional safeguard objective
               <textarea name="safeguard_goal" rows="2" maxlength="1000" placeholder="Example: avoid rapid forced selling while allowing proportionate hedging."></textarea>
             </label>
@@ -307,6 +311,7 @@ function renderConfigure() {
   document.querySelector("#create-form").addEventListener("submit", createAssessment);
   document.querySelector("#event-select").addEventListener("change", applyPreset);
   document.querySelector("#include-safeguard").addEventListener("change", updateEstimate);
+  document.querySelector("#use-cached").addEventListener("change", updateEstimate);
   document.querySelectorAll('[name="institution_ids"], [name="samples_per_agent"]').forEach(
     input => input.addEventListener("change", updateEstimate)
   );
@@ -345,9 +350,18 @@ function updateEstimate() {
   const selected = document.querySelectorAll('[name="institution_ids"]:checked').length;
   const samples = Number(document.querySelector('[name="samples_per_agent"]')?.value || 1);
   const cases = document.querySelector("#include-safeguard")?.checked ? 3 : 2;
+  const replayRequested = document.querySelector("#use-cached")?.checked;
   document.querySelector("#estimate-institutions").textContent = selected;
   document.querySelector("#estimate-runs").textContent = selected * samples * cases;
-  document.querySelector("#estimate-calls").textContent = 2 + selected * samples * 2;
+  document.querySelector("#estimate-calls").textContent = replayRequested
+    ? "0*"
+    : 2 + selected * samples * 2;
+  const note = document.querySelector(".estimate-note");
+  if (note) {
+    note.textContent = replayRequested
+      ? "0 new calls on an exact cache hit; otherwise the normal live call plan applies."
+      : "Planned calls before any provider validation retries.";
+  }
 }
 
 function showBuilderError(message) {
@@ -479,9 +493,12 @@ async function createAssessment(event) {
     include_safeguard: form.has("include_safeguard"),
     safeguard_goal: form.get("safeguard_goal"),
     execution_mode: form.get("execution_mode"),
+    use_cached: form.has("use_cached"),
   };
+  const replayRequested = form.has("use_cached");
   app.innerHTML = `<div class="loading" role="status"><span class="spinner"></span>
-    <strong>Creating the assessment</strong><small>Starting runtime evidence connectors…</small></div>`;
+    <strong>${replayRequested ? "Looking for an exact released assessment" : "Creating the assessment"}</strong>
+    <small>${replayRequested ? "A cache miss will continue with the normal live workflow…" : "Starting runtime evidence connectors…"}</small></div>`;
   try {
     state.assessment = await api("/assessments", {method: "POST", body});
     state.assessmentView = "results";
@@ -489,8 +506,12 @@ async function createAssessment(event) {
       null, "", `?assessment=${encodeURIComponent(state.assessment.id)}`
     );
     activeId.textContent = state.assessment.id;
-    renderAssessment();
-    startPolling();
+    if (state.assessment.cache_replay?.playback) {
+      startCacheReplay();
+    } else {
+      renderAssessment();
+      startPolling();
+    }
   } catch (error) {
     app.innerHTML = errorBox(error) + `<button id="back-to-builder">Return to builder</button>`;
     document.querySelector("#back-to-builder").addEventListener("click", renderConfigure);
@@ -535,6 +556,78 @@ function workflow(a) {
       <div><strong>${esc(step.label)}</strong><small>${esc(step.message || step.status)}</small></div>
       <span class="state">${esc(step.status)}</span>
     </div>`).join("")}</div></details>`;
+}
+
+function cacheReplayNotice(a, active = false) {
+  if (!a.cache_replay?.hit) return "";
+  const sourceId = a.cache_replay.source_assessment_id || a.id;
+  return `<section class="cache-replay-notice" role="status">
+    <div><span class="eyebrow">CACHED REPLAY</span>
+      <strong>${active ? "Replaying the verified execution log" : "Verified assessment replay"}</strong>
+      <small>No evidence or model provider calls are being made. The saved result and approvals remain attributed to assessment ${esc(sourceId)}.</small>
+    </div>${active ? '<button id="skip-cache-replay" type="button">Skip to results →</button>' : ""}
+  </section>`;
+}
+
+function stopCacheReplay() {
+  if (state.cacheReplayTimer !== null) {
+    clearTimeout(state.cacheReplayTimer);
+    state.cacheReplayTimer = null;
+  }
+}
+
+function finishCacheReplay() {
+  stopCacheReplay();
+  if (state.assessment?.cache_replay) {
+    state.assessment.cache_replay.playback = false;
+  }
+  state.assessmentView = "results";
+  renderAssessment();
+}
+
+function startCacheReplay() {
+  stopCacheReplay();
+  const assessment = state.assessment;
+  const savedWorkflow = assessment.workflow.map(step => ({...step}));
+  const intervalMs = 550;
+  let completed = 0;
+  state.disclosures.set(`${assessment.id}:workflow`, true);
+
+  const renderFrame = () => {
+    if (state.assessment !== assessment) return;
+    const replayWorkflow = savedWorkflow.map((step, index) => {
+      if (index < completed) return {
+        ...step,
+        status: step.status === "skipped" ? "skipped" : "complete",
+      };
+      if (index === completed && completed < savedWorkflow.length) return {
+        ...step,
+        status: step.status === "skipped" ? "skipped" : "running",
+        message: step.status === "skipped"
+          ? step.message
+          : `Cached replay · ${step.message || "restoring verified output"}`,
+      };
+      return {...step, status: "pending", message: "Waiting for cached replay"};
+    });
+    const replayView = {...assessment, status: "running", workflow: replayWorkflow};
+    activeId.textContent = assessment.id;
+    app.innerHTML = `${cacheReplayNotice(assessment, true)}
+      <section class="assessment-head"><div><span class="eyebrow">ASSESSMENT ${esc(assessment.id)}</span>
+        <h2>${esc(assessment.classification?.event_label || "Cached assessment replay")}</h2>
+        <p role="status" aria-live="polite">Replaying step ${Math.min(completed + 1, savedWorkflow.length)} of ${savedWorkflow.length}</p></div>
+        <span class="status running">cached replay</span></section>
+      ${phaseRail(replayView)}
+      ${workflow(replayView)}`;
+    document.querySelector("#skip-cache-replay")?.addEventListener("click", finishCacheReplay);
+
+    if (completed < savedWorkflow.length) {
+      completed += 1;
+      state.cacheReplayTimer = setTimeout(renderFrame, intervalMs);
+    } else {
+      state.cacheReplayTimer = setTimeout(finishCacheReplay, 700);
+    }
+  };
+  renderFrame();
 }
 
 function retryPanel(a) {
@@ -896,7 +989,9 @@ function plainValidationIssue(value) {
 }
 
 function activityKind(item) {
-  return item.kind === "schema_repair" ? "AI answer correction" : item.kind;
+  if (item.kind === "schema_repair") return "AI answer correction";
+  if (item.kind === "cache_replay") return "Cached demo replay";
+  return item.kind;
 }
 
 function activityMessage(a, item) {
@@ -1019,7 +1114,7 @@ function renderDemoResult(a) {
   const warnings = (result.warnings || []).length
     ? `<div class="result-warnings">${result.warnings.map(item => `<p>${esc(item)}</p>`).join("")}</div>`
     : "";
-  app.innerHTML = `${assessmentTabs("results")}<section class="result-hero">
+  app.innerHTML = `${assessmentTabs("results")}${cacheReplayNotice(a)}<section class="result-hero">
       <div class="result-meta">Assessment · ${esc(result.start_date)} → ${esc(result.end_date)} · ${result.institution_count} scenario institutions · ${esc(result.status)}</div>
       <h2>${esc(resultSummary)}</h2>
       ${peakImpactDetail}
@@ -1080,6 +1175,7 @@ function renderAssessment() {
   activeId.textContent = a.id;
   const statusText = a.status.replaceAll("_", " ");
   app.innerHTML = `${a.demo_result ? assessmentTabs("audit") : ""}
+    ${cacheReplayNotice(a)}
     <section class="assessment-head"><div><span class="eyebrow">ASSESSMENT ${esc(a.id)}</span>
       <h2>${esc(a.classification?.event_label || "Building assessment from runtime evidence")}</h2>
       <p id="live-status" role="status" aria-live="polite">${esc(statusText)}</p></div>
@@ -1363,10 +1459,12 @@ async function renderHistory() {
 }
 
 document.querySelector("#new-assessment").addEventListener("click", () => {
+  stopCacheReplay();
   history.replaceState(null, "", window.location.pathname);
   renderConfigure();
 });
 document.querySelector("#show-history").addEventListener("click", () => {
+  stopCacheReplay();
   state.history = null;
   state.historyQuery = {page: 1, pageSize: 10, eventId: "", status: ""};
   renderHistory();

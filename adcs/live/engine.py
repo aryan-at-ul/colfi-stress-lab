@@ -51,11 +51,27 @@ class AssessmentEngine:
                              error, {"recoverable": True})
             self.store.update(row["id"], status="failed", error=error)
 
-    def create(self, request: AssessmentRequest) -> str:
+    def create(self, request: AssessmentRequest) -> tuple[str, bool]:
+        request_data = request.model_dump(mode="json")
+        if request.use_cached:
+            source_id = self.store.find_completed_replay(request_data)
+            if source_id:
+                self.store.event(
+                    source_id,
+                    "replay",
+                    "cache_replay",
+                    "Returned an exactly matching released assessment as a demo replay",
+                    {
+                        "source_assessment_id": source_id,
+                        "requested_by": request.created_by,
+                        "replay_key_sha256": self.store.replay_key(request_data),
+                    },
+                )
+                return source_id, True
         assessment_id = f"AST-{uuid.uuid4().hex[:10].upper()}"
-        self.store.create(assessment_id, request.model_dump(mode="json"))
+        self.store.create(assessment_id, request_data)
         self._start(assessment_id, self._collect)
-        return assessment_id
+        return assessment_id, False
 
     def retry(self, assessment_id: str):
         row = self._require(assessment_id)
