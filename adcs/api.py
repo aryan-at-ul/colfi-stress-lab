@@ -207,6 +207,10 @@ def _workflow(row: dict, events: list[dict]) -> list[dict]:
 def _view(row: dict) -> dict:
     events = STORE.events(row["id"])
     approvals = STORE.approvals(row["id"])
+    replay_event = next(
+        (event for event in reversed(events) if event["kind"] == "cache_replay"),
+        None,
+    )
     metrics = row.get("metrics") or {}
     legacy_result = bool(metrics) and not metrics.get("execution_simulation")
     visible_row = dict(row)
@@ -236,6 +240,18 @@ def _view(row: dict) -> dict:
         "approvals": approvals,
         "activity": events,
         "demo_result": build_demo_result(row, approvals, events),
+        "cache_replay": {
+            "requested": bool(
+                row.get("request", {}).get("use_cached") or replay_event
+            ),
+            "hit": replay_event is not None,
+            "source_assessment_id": (
+                replay_event["payload"].get("source_assessment_id")
+                if replay_event else None
+            ),
+            "replayed_at": replay_event["at"] if replay_event else None,
+            "playback": False,
+        },
         "runtime_contract": {
             "institutions": (
                 "Portfolios are declared sandbox inputs from the COLFI brief, "
@@ -869,8 +885,10 @@ def create_assessment(request: AssessmentRequest):
     if os.environ.get("ADCS_LLM_MODE") != "live":
         raise HTTPException(503, "ADCS_LLM_MODE must be live; no mock mode exists")
     request = _normalise_request(request)
-    assessment_id = ENGINE.create(request)
-    return _view(_get(assessment_id))
+    assessment_id, cache_hit = ENGINE.create(request)
+    view = _view(_get(assessment_id))
+    view["cache_replay"]["playback"] = cache_hit
+    return view
 
 
 @app.get("/api/assessments")

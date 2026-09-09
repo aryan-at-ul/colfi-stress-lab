@@ -207,6 +207,11 @@ def test_request_rejects_simulated_or_duplicate_agent_assignment():
         ])
 
 
+def test_cached_replay_is_explicitly_opt_in():
+    assert request().use_cached is False
+    assert request(use_cached=True).use_cached is True
+
+
 def test_decision_schema_rejects_stance_action_contradiction():
     with pytest.raises(ValidationError):
         InstitutionDecision.model_validate({
@@ -598,6 +603,31 @@ def test_store_persists_configuration_events_and_approval(tmp_path: Path):
     assert store.approvals("AST-TEST")[0]["approved"] is True
 
 
+def test_store_replay_match_requires_exact_released_computational_inputs(
+    tmp_path: Path,
+):
+    store = LiveStore(tmp_path / "replay.sqlite3")
+    source = request(use_cached=False, created_by="Original operator")
+    store.create("AST-RELEASED", source.model_dump(mode="json"))
+    store.update(
+        "AST-RELEASED",
+        status="complete",
+        metrics={"execution_simulation": {}},
+        report={"title": "Released result"},
+    )
+
+    replay = request(use_cached=True, created_by="Demo presenter")
+    assert store.find_completed_replay(replay.model_dump(mode="json")) == (
+        "AST-RELEASED"
+    )
+    assert store.find_completed_replay(
+        request(use_cached=True, samples_per_agent=2).model_dump(mode="json")
+    ) is None
+
+    store.update("AST-RELEASED", status="failed")
+    assert store.find_completed_replay(replay.model_dump(mode="json")) is None
+
+
 def test_store_returns_stable_ten_item_assessment_pages(tmp_path: Path):
     store = LiveStore(tmp_path / "history.sqlite3")
     for index in range(12):
@@ -737,6 +767,82 @@ def test_restart_marks_running_step_failed_and_retryable(tmp_path: Path):
     assert row["status"] == "failed"
     assert "restarted" in row["error"]
     assert store.events("AST-INTERRUPTED")[-1]["kind"] == "step_failed"
+
+
+def test_engine_replays_exact_release_but_uncached_request_starts_fresh(
+    tmp_path: Path,
+):
+    store = LiveStore(tmp_path / "engine-replay.sqlite3")
+    engine = AssessmentEngine(store)
+    source = request(use_cached=False, created_by="Original operator")
+    store.create("AST-CACHE-SOURCE", source.model_dump(mode="json"))
+    store.update(
+        "AST-CACHE-SOURCE",
+        status="complete",
+        current_step="release_review",
+        metrics={"execution_simulation": {}},
+        report={"title": "Released result"},
+    )
+    started = []
+    engine._start = lambda assessment_id, target: started.append(
+        (assessment_id, target.__name__)
+    )
+
+    assessment_id, cache_hit = engine.create(
+        request(use_cached=True, created_by="Demo presenter")
+    )
+
+    assert (assessment_id, cache_hit) == ("AST-CACHE-SOURCE", True)
+    assert started == []
+    replay_event = store.events("AST-CACHE-SOURCE")[-1]
+    assert replay_event["kind"] == "cache_replay"
+    assert replay_event["payload"]["requested_by"] == "Demo presenter"
+    assert replay_event["payload"]["source_assessment_id"] == (
+        "AST-CACHE-SOURCE"
+    )
+
+    fresh_id, fresh_cache_hit = engine.create(
+        request(use_cached=False, created_by="Demo presenter")
+    )
+    assert fresh_id != "AST-CACHE-SOURCE"
+    assert fresh_cache_hit is False
+    assert started == [(fresh_id, "_collect")]
+
+
+def test_create_assessment_marks_only_current_cache_hit_for_browser_playback(
+    tmp_path: Path,
+    monkeypatch,
+):
+    from adcs import api as api_module
+
+    store = LiveStore(tmp_path / "api-replay.sqlite3")
+    source = request(use_cached=False, created_by="Original operator")
+    store.create("AST-API-CACHE", source.model_dump(mode="json"))
+    store.update(
+        "AST-API-CACHE",
+        status="complete",
+        current_step="release_review",
+        metrics={"execution_simulation": {}},
+        report={"title": "Released result"},
+    )
+    monkeypatch.setenv("ADCS_LLM_MODE", "live")
+    monkeypatch.setattr(api_module, "STORE", store)
+    monkeypatch.setattr(api_module, "ENGINE", AssessmentEngine(store))
+    monkeypatch.setattr(api_module, "_normalise_request", lambda value: value)
+
+    view = api_module.create_assessment(
+        request(use_cached=True, created_by="Demo presenter")
+    )
+
+    assert view["id"] == "AST-API-CACHE"
+    assert view["cache_replay"] == {
+        "requested": True,
+        "hit": True,
+        "source_assessment_id": "AST-API-CACHE",
+        "replayed_at": view["activity"][-1]["at"],
+        "playback": True,
+    }
+    assert view["activity"][-1]["kind"] == "cache_replay"
 
 
 def test_retry_immediately_returns_running_and_preserves_valid_results(tmp_path: Path):

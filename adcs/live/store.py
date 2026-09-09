@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import sqlite3
 import threading
@@ -111,6 +112,38 @@ class LiveStore:
             return [self._decode(r) for r in db.execute(
                 "SELECT * FROM live_assessments ORDER BY created_at DESC"
             ).fetchall()]
+
+    @staticmethod
+    def replay_key(request: dict) -> str:
+        """Hash computational inputs while excluding replay/operator metadata."""
+        inputs = dict(request)
+        inputs.pop("use_cached", None)
+        inputs.pop("created_by", None)
+        encoded = json.dumps(
+            inputs, sort_keys=True, separators=(",", ":"), default=str
+        ).encode()
+        return hashlib.sha256(encoded).hexdigest()
+
+    def find_completed_replay(self, request: dict) -> str | None:
+        """Return the newest exact, released v4 result eligible for replay."""
+        requested_key = self.replay_key(request)
+        with self._connect() as db:
+            rows = db.execute(
+                "SELECT id, request_json, metrics_json, report_json "
+                "FROM live_assessments WHERE status='complete' "
+                "ORDER BY updated_at DESC, id DESC"
+            ).fetchall()
+        for row in rows:
+            stored_request = json.loads(row["request_json"] or "null") or {}
+            metrics = json.loads(row["metrics_json"] or "null") or {}
+            report = json.loads(row["report_json"] or "null")
+            if (
+                "execution_simulation" in metrics
+                and report is not None
+                and self.replay_key(stored_request) == requested_key
+            ):
+                return str(row["id"])
+        return None
 
     def assessment_page(
         self,

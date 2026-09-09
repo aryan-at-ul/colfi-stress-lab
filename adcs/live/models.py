@@ -76,6 +76,13 @@ class AssessmentRequest(BaseModel):
     include_safeguard: bool = True
     safeguard_goal: str = Field(default="", max_length=1000)
     execution_mode: ExecutionMode = "llm_decision"
+    use_cached: bool = Field(
+        default=False,
+        description=(
+            "Reuse an exactly matching released assessment for an explicitly "
+            "labelled demo replay. False always starts a fresh assessment."
+        ),
+    )
     created_by: str = Field(min_length=1, max_length=100)
 
     @field_validator("sources", "instruments")
