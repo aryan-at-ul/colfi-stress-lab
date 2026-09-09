@@ -569,6 +569,72 @@ function cacheReplayNotice(a, active = false) {
   </section>`;
 }
 
+const CACHE_REPLAY_APPROVAL_STEPS = new Set([
+  "evidence_review", "event_review", "suite_review", "release_review",
+]);
+
+function cacheReplayApproval(a, gateId) {
+  if (!CACHE_REPLAY_APPROVAL_STEPS.has(gateId)) return "";
+  const approval = a.approvals.slice().reverse().find(item =>
+    item.gate === gateId && item.approved
+  );
+  const approvedAt = approval
+    ? new Date(Number(approval.at) * 1000).toLocaleString()
+    : "Original approval timestamp unavailable";
+  const approver = approval?.actor || "Original approver unavailable";
+  const note = approval?.note || "No audit note was recorded.";
+  const evidenceCount = a.evidence?.items?.length || 0;
+  const caseCount = a.plan?.cases?.length || 0;
+  const cap = a.plan?.safeguard?.max_daily_portfolio_sell_pct
+    ?? a.plan?.safeguard?.max_single_asset_sell_pct;
+  const content = {
+    evidence_review: {
+      title: "Evidence is ready for replay review",
+      description: `${evidenceCount} saved evidence items passed the original correctness checks.`,
+      fields: `<div class="grid two">
+        <label>Evidence items<input value="${esc(evidenceCount)} captured items" readonly></label>
+        <label>Verification<input value="${a.evidence?.verification?.passed ? "Passed" : "Unavailable"}" readonly></label>
+      </div>`,
+    },
+    event_review: {
+      title: "Replay the supervisor’s event approval",
+      description: "Review the saved supervisor classification before continuing the replay.",
+      fields: `<div class="grid two">
+        <label>Approved taxonomy<input value="${esc(a.classification?.event_type || "Unavailable")}" readonly></label>
+        <label>Approved event label<input value="${esc(a.classification?.event_label || "Unavailable")}" readonly></label>
+      </div><label>Supervisor rationale<textarea rows="3" readonly>${esc(a.classification?.rationale || "Unavailable")}</textarea></label>`,
+    },
+    suite_review: {
+      title: "Replay the supervisor’s test-suite approval",
+      description: `Review the saved ${caseCount}-case suite and safeguard input before continuing.`,
+      fields: `<label>Assessment objective<textarea rows="3" readonly>${esc(a.plan?.objective || "Unavailable")}</textarea></label>
+        <div class="grid two">
+          <label>Assessment cases<input value="${esc(caseCount)} saved cases" readonly></label>
+          <label>Safeguarded sale cap<input value="${cap == null ? "Unavailable" : `${esc(cap)}%`}" readonly></label>
+        </div><label>Safeguard instruction<textarea rows="3" readonly>${esc(a.plan?.safeguard?.instruction || "Unavailable")}</textarea></label>`,
+    },
+    release_review: {
+      title: "Replay the final release approval",
+      description: "Review the saved verified report before opening the released result.",
+      fields: `<label>Report title<input value="${esc(a.report?.title || "Verified assessment report")}" readonly></label>
+        <label>Executive summary<textarea rows="3" readonly>${esc(a.report?.executive_summary || "Verified result retained from the original assessment.")}</textarea></label>`,
+    },
+  }[gateId];
+  return `<section class="checkpoint cache-replay-gate" aria-labelledby="cache-replay-gate-title">
+    <div class="checkpoint-icon">!</div><div class="checkpoint-body">
+      <span class="eyebrow">REPLAYED HUMAN CHECKPOINT</span>
+      <h2 id="cache-replay-gate-title">${esc(content.title)}</h2>
+      <p>${esc(content.description)}</p>${content.fields}
+      <div class="grid two replay-signoff">
+        <label>Original approver<input value="${esc(approver)}" readonly></label>
+        <label>Original approval time<input value="${esc(approvedAt)}" readonly></label>
+      </div>
+      <label>Original audit note<input value="${esc(note)}" readonly></label>
+      <div class="button-row"><small>This button advances playback only; it does not create or alter an approval.</small>
+        <button id="replay-approval" class="primary" type="button">Replay approval and continue →</button></div>
+    </div></section>`;
+}
+
 function stopCacheReplay() {
   if (state.cacheReplayTimer !== null) {
     clearTimeout(state.cacheReplayTimer);
@@ -595,6 +661,11 @@ function startCacheReplay() {
 
   const renderFrame = () => {
     if (state.assessment !== assessment) return;
+    state.cacheReplayTimer = null;
+    const currentStep = savedWorkflow[completed];
+    const awaitingReplayApproval = CACHE_REPLAY_APPROVAL_STEPS.has(
+      currentStep?.id
+    );
     const replayWorkflow = savedWorkflow.map((step, index) => {
       if (index < completed) return {
         ...step,
@@ -602,27 +673,43 @@ function startCacheReplay() {
       };
       if (index === completed && completed < savedWorkflow.length) return {
         ...step,
-        status: step.status === "skipped" ? "skipped" : "running",
+        status: step.status === "skipped"
+          ? "skipped"
+          : awaitingReplayApproval ? "waiting" : "running",
         message: step.status === "skipped"
           ? step.message
-          : `Cached replay · ${step.message || "restoring verified output"}`,
+          : awaitingReplayApproval
+            ? "Cached replay · waiting for presenter approval"
+            : `Cached replay · ${step.message || "restoring verified output"}`,
       };
       return {...step, status: "pending", message: "Waiting for cached replay"};
     });
-    const replayView = {...assessment, status: "running", workflow: replayWorkflow};
+    const replayView = {
+      ...assessment,
+      status: awaitingReplayApproval ? "waiting" : "running",
+      workflow: replayWorkflow,
+    };
     activeId.textContent = assessment.id;
     app.innerHTML = `${cacheReplayNotice(assessment, true)}
       <section class="assessment-head"><div><span class="eyebrow">ASSESSMENT ${esc(assessment.id)}</span>
         <h2>${esc(assessment.classification?.event_label || "Cached assessment replay")}</h2>
-        <p role="status" aria-live="polite">Replaying step ${Math.min(completed + 1, savedWorkflow.length)} of ${savedWorkflow.length}</p></div>
-        <span class="status running">cached replay</span></section>
+        <p role="status" aria-live="polite">${awaitingReplayApproval ? "Presenter approval required" : `Replaying step ${Math.min(completed + 1, savedWorkflow.length)} of ${savedWorkflow.length}`}</p></div>
+        <span class="status ${awaitingReplayApproval ? "waiting" : "running"}">${awaitingReplayApproval ? "awaiting replay approval" : "cached replay"}</span></section>
       ${phaseRail(replayView)}
+      ${cacheReplayApproval(assessment, currentStep?.id)}
       ${workflow(replayView)}`;
     document.querySelector("#skip-cache-replay")?.addEventListener("click", finishCacheReplay);
 
     if (completed < savedWorkflow.length) {
-      completed += 1;
-      state.cacheReplayTimer = setTimeout(renderFrame, intervalMs);
+      if (awaitingReplayApproval) {
+        document.querySelector("#replay-approval")?.addEventListener("click", () => {
+          completed += 1;
+          renderFrame();
+        });
+      } else {
+        completed += 1;
+        state.cacheReplayTimer = setTimeout(renderFrame, intervalMs);
+      }
     } else {
       state.cacheReplayTimer = setTimeout(finishCacheReplay, 700);
     }
